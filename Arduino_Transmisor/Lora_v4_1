@@ -1,0 +1,638 @@
+import serial
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+import numpy as np
+
+# =====================================================
+# CONFIGURACIÓN DE PUERTO SERIE
+# =====================================================
+
+estacion_tierra = 'COM6'      # Puerto de la estación de Tierra
+BAUDRATE = 9600
+com = serial.Serial(estacion_tierra, BAUDRATE, timeout=1)
+time.sleep(2)
+
+# =====================================================
+# VARIABLES GLOBALES - TEMPERATURA / HUMEDAD
+# =====================================================
+
+temperaturas = []
+humedades = []
+medias_10 = []
+tiempos_TH = []
+
+recibiendo = False
+recepcion_activa = True
+
+temp = 0.0
+hum = 0.0
+limite_temp = 30.0
+t0_TH = None
+VENTANA_TIEMPO = 30.0
+
+temp_buffer = None
+hum_buffer = None
+
+# =====================================================
+# VARIABLES GLOBALES - RADAR ULTRASÓNICO
+# =====================================================
+
+angulos = []
+distancias = []
+historial_validas = []
+max_escala = 30
+ventana_puntos = 7
+margen_reduccion_dist = 50.0
+tiempo_ventana_dist = 5.0
+errores_distancia = 0
+ultimo_cambio_escala_tiempo = time.time()
+
+ultimo_angulo_deg = 90.0  # frontal
+
+# Para la predicción del ángulo
+servo_tiempo_ciclo_180 = 1.8     # segundos para recorrer 0–180º (ajustable desde la GUI)
+servo_ultima_sync_t = None       # instante de la última medición REAL de ángulo
+servo_ultima_sync_ang = ultimo_angulo_deg
+servo_direccion = 1              # +1 si va hacia 180, -1 si va hacia 0
+usar_prediccion_servo = True     # siempre usar el modelo salvo que lo quieras desactivar a mano
+
+
+# =====================================================
+# MENSAJES / ECOS DESDE SATÉLITE
+# =====================================================
+
+mensajes_sat = []
+
+CODIGOS_ECO = {         # estos son los mensajes en código numérico que llegan desde el satélite y su significado
+
+    100: "SAT_INIT → Satélite iniciado. Transmitiendo datos.",
+    101: "SAT_GLOBAL_START → Inicio global de envíos y movimiento del servo.",
+    102: "SAT_GLOBAL_STOP → Parada global de envíos y movimiento del servo.",
+    103: "SAT_GLOBAL_T_OFF → Periodo GLOBAL desactivado (sin límite).",
+    104: "SAT_GLOBAL_T_SET → Periodo GLOBAL actualizado.",
+    105: "SAT_GLOBAL_T_ERR → Periodo GLOBAL fuera de rango.",
+    190: "SAT_CHK_ERR → Checksum incorrecto en comando recibido por el satélite.",
+
+    200: "DHT_ON → Envío de datos T/H activado.",
+    201: "DHT_OFF → Envío de datos T/H detenido.",
+    202: "DHT_T_SET → Periodo T/H actualizado.",
+    203: "DHT_T_ERR → Periodo T/H fuera de rango.",
+    204: "DHT_MEAN_PY → Media T en Tierra (Python).",
+    205: "DHT_MEAN_SAT → Media T en Satélite.",
+    
+    300: "SERVO_SET_OK → Servo movido al ángulo solicitado.",
+    301: "SERVO_ANGLE_ERR → Ángulo de servo fuera de rango.",
+    302: "SERVO_AUTO_OFF → Movimiento automático del servo detenido.",
+    303: "SERVO_AUTO_ON → Movimiento automático del servo reanudado.",
+    304: "SERVO_TLM_OFF → Telemetría de servo desactivada.",
+    305: "SERVO_TLM_SET → Telemetría de servo actualizada.",
+    306: "SERVO_TLM_ERR → Periodo telemetría servo fuera de rango.",
+    307: "SERVO_TC_SET → Tiempo de ciclo del servo actualizado.",
+    308: "SERVO_TC_ERR → Tiempo de ciclo del servo fuera de rango.",
+    
+    400: "DIST_ON → Envío de distancia activado.",
+    401: "DIST_OFF → Envío de distancia detenido.",
+    402: "DIST_T_SET → Periodo distancia actualizado.",
+    403: "DIST_T_ERR → Periodo distancia fuera de rango."
+}
+
+# =====================================================
+# FUNCIONES AUXILIARES
+# =====================================================
+
+def actualizar_radiales(ax, max_escala_local):
+    num_divisiones = 6
+    ticks = np.linspace(0, max_escala_local, num_divisiones + 1)
+    ticks_visibles = ticks[::2]
+    ax.set_yticks(ticks_visibles)
+    ax.set_yticklabels([f"{int(t)}" for t in ticks_visibles], fontsize=9)
+
+def append_mensaje_sat(texto):
+    def _inner():
+        ahora = time.time()
+        mensajes_sat.append((texto, ahora))
+        actualizar_mensajes_satelite()
+    root.after(0, _inner)
+
+# =====================================================
+# INTERFAZ GRÁFICA (Tkinter)
+# =====================================================
+
+root = tk.Tk()
+root.title("Control del satélite")
+
+frame_izq = ttk.Frame(root, padding=10)
+frame_izq.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+frame_der = ttk.Frame(root, padding=10)
+frame_der.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+# -------------------------
+# Límite de temperatura media
+# -------------------------
+frame_limite = ttk.Frame(frame_izq, padding=10)
+frame_limite.pack(side=tk.TOP, fill=tk.X)
+ttk.Label(frame_limite, text="Límite de temperatura media (°C):").pack(side=tk.LEFT)
+limite_entry = ttk.Entry(frame_limite, width=5)
+limite_entry.insert(0, str(limite_temp))
+limite_entry.pack(side=tk.LEFT)
+
+def actualizar_limite():
+    global limite_temp
+    try:
+        limite_temp = float(limite_entry.get())
+        print(f"Límite actualizado a: {limite_temp} °C")
+    except ValueError:
+        messagebox.showerror("Error", "Introduce un número válido")
+
+ttk.Button(frame_limite, text="Actualizar", command=actualizar_limite).pack(side=tk.LEFT, padx=5)
+
+# -------------------------
+# BOTÓN PARA INICIAR TRANSMISIÓN GLOBAL
+# -------------------------
+frame_comandos = ttk.Frame(frame_izq, padding=10)
+frame_comandos.pack(side=tk.TOP, fill=tk.X)
+
+def enviar_start_global():
+    """Envía el comando 0:1:0 (START global) hacia la estación de Tierra."""
+    try:
+        com.write(b"0:1:0|")
+        append_mensaje_sat("Comando enviado: 0:1:0 (START global)")
+        print("Enviado a estación de Tierra: 0:1:0|")
+    except Exception as e:
+        append_mensaje_sat(f"Error enviando START global: {e}")
+        print("Error enviando START global:", e)
+
+btn_start = ttk.Button(frame_comandos, text="Iniciar transmisión global", command=enviar_start_global)
+btn_start.pack(side=tk.LEFT, padx=5)
+
+
+# Control tiempo ciclo del servo (0-180º)
+
+frame_servo_ciclo = ttk.Frame(frame_izq, padding=10)
+frame_servo_ciclo.pack(side=tk.TOP, fill=tk.X)
+
+ttk.Label(
+    frame_servo_ciclo,
+    text="Tiempo ciclo servo (s para 0–180º):"
+).pack(side=tk.LEFT)
+
+entrada_servo_ciclo = ttk.Entry(frame_servo_ciclo, width=6)
+entrada_servo_ciclo.insert(0, str(servo_tiempo_ciclo_180))
+entrada_servo_ciclo.pack(side=tk.LEFT, padx=5)
+
+def actualizar_tiempo_ciclo_servo():
+    """Actualiza el tiempo del ciclo en Python y lo envía al satélite (2:5:Tciclo)."""
+    global servo_tiempo_ciclo_180
+    try:
+        valor_seg = float(entrada_servo_ciclo.get())
+        if valor_seg <= 0:
+            raise ValueError
+        servo_tiempo_ciclo_180 = valor_seg
+        ms = int(round(valor_seg * 1000.0))
+        comando = f"2:5:{ms}|".encode("ascii")
+        com.write(comando)
+        append_mensaje_sat(
+            f"Tiempo ciclo servo enviado: {valor_seg:.2f} s ({ms} ms)."
+        )
+    except ValueError:
+        messagebox.showerror(
+            "Error",
+            "Introduce un tiempo válido (>0) para el ciclo del servo."
+        )
+
+ttk.Button(
+    frame_servo_ciclo,
+    text="Aplicar tiempo ciclo",
+    command=actualizar_tiempo_ciclo_servo
+).pack(side=tk.LEFT, padx=5)
+
+
+# =====================================================
+# GRÁFICAS TEMPERATURA/HUMEDAD
+# =====================================================
+
+fig_temp, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(6, 8))
+fig_temp.tight_layout(pad=3)
+linea_temp, = ax1.plot([], [], 'y-', label="Temperatura")
+linea_hum, = ax2.plot([], [], 'c-', label="Humedad")
+linea_media, = ax3.plot([], [], 'r-', label="Media móvil (10 muestras)")
+
+for ax in (ax1, ax2, ax3):
+    ax.legend()
+
+ax1.set_ylabel("°C")
+ax2.set_ylabel("%")
+ax3.set_ylabel("°C (Media)")
+ax3.set_xlabel("Tiempo (s)")
+
+canvas_temp = FigureCanvasTkAgg(fig_temp, master=frame_izq)
+canvas_temp.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+# =====================================================
+# CUADRO DE MENSAJES DEL SATÉLITE
+# =====================================================
+
+frame_mensajes_satelite = ttk.Frame(frame_der, padding=10)
+frame_mensajes_satelite.pack(fill="both", expand=False)
+
+ttk.Label(frame_mensajes_satelite, text="Mensajes del satélite / estación:").pack(anchor="w")
+
+text_mensajes_satelite = tk.Text(frame_mensajes_satelite, height=8, state="disabled", wrap="word")
+text_mensajes_satelite.pack(fill="both", expand=True)
+
+def actualizar_mensajes_satelite():
+    global mensajes_sat
+    ahora = time.time()
+
+    mensajes_sat = [
+        (txt, ts) for (txt, ts) in mensajes_sat
+        if ahora - ts <= 4.0
+    ]
+    mensajes_visibles = mensajes_sat[-5:]
+
+    text_mensajes_satelite.configure(state="normal")
+    text_mensajes_satelite.delete("1.0", tk.END)
+    for txt, ts in mensajes_visibles:
+        text_mensajes_satelite.insert(tk.END, txt + "\n")
+    text_mensajes_satelite.configure(state="disabled")
+
+# =====================================================
+# GRÁFICA RADAR ULTRASÓNICO (polar)
+# =====================================================
+
+fig_radar = plt.Figure(figsize=(6, 6))
+ax_radar = fig_radar.add_subplot(111, polar=True)
+ax_radar.set_ylim(0, max_escala)
+ax_radar.set_theta_zero_location("N")
+ax_radar.set_theta_direction(-1)
+ax_radar.set_thetamin(-90)
+ax_radar.set_thetamax(90)
+line_radar, = ax_radar.plot([], [], marker='', linestyle=':', linewidth=2)
+ax_radar.set_title("Radar ultrasónico", pad=25)
+text_label = ax_radar.text(
+    0.5, 1.0, "", transform=ax_radar.transAxes,
+    ha='center', va='bottom', fontsize=12, color='gray'
+)
+actualizar_radiales(ax_radar, max_escala)
+
+canvas_radar = FigureCanvasTkAgg(fig_radar, master=frame_der)
+canvas_radar.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+# =====================================================
+# LÓGICA DE RECEPCIÓN Y PARSEO
+# =====================================================
+
+def commit_muestra_TH():
+    global temp, hum, temp_buffer, hum_buffer, t0_TH
+
+    if temp_buffer is None:
+        return
+
+    temp = temp_buffer
+    if hum_buffer is not None:
+        hum = hum_buffer
+
+    if t0_TH is None:
+        t0_TH = time.time()
+    t_rel = time.time() - t0_TH
+
+    tiempos_TH.append(t_rel)
+    temperaturas.append(temp)
+    humedades.append(hum)
+
+    ultimos = [t for t in temperaturas[-10:] if t is not None]
+    if len(ultimos) > 0:
+        medias_10.append(sum(ultimos) / len(ultimos))
+    else:
+        medias_10.append(np.nan)
+
+def manejar_error_codigo(codigo_str):
+    global errores_distancia, angulos, distancias, ultimo_angulo_deg
+
+    try:
+        codigo = int(codigo_str)
+    except ValueError:
+        append_mensaje_sat(f"Error desconocido: {codigo_str}")
+        return
+
+    if codigo == -2:
+        append_mensaje_sat("Error en lectura de humedad (código -2).")
+    elif codigo == -3:
+        append_mensaje_sat("Error en lectura de temperatura (código -3).")
+    elif codigo == -5:
+        append_mensaje_sat("Error en medición de distancia (código -5).")
+    elif codigo == -6:
+        append_mensaje_sat("Error en servo (código -6).")
+    else:
+        append_mensaje_sat(f"Error genérico del satélite ({codigo}).")
+
+    if codigo in (-2, -3):
+        if t0_TH is None:
+            t_ref = time.time()
+        else:
+            t_ref = t0_TH
+        t_rel = time.time() - (t_ref if t0_TH is not None else time.time())
+        tiempos_TH.append(t_rel)
+        temperaturas.append(np.nan)
+        humedades.append(np.nan)
+        medias_10.append(np.nan)
+
+    if codigo == -5:
+        angulo_deg_radar = obtener_angulo_para_radar()
+        angulo_rad = np.deg2rad(angulo_deg_radar - 90.0)
+        angulos.append(angulo_rad)
+        distancias.append(np.nan)
+        if len(angulos) > ventana_puntos:
+            angulos[:] = angulos[-ventana_puntos:]
+            distancias[:] = distancias[-ventana_puntos:]
+        line_radar.set_xdata(angulos)
+        line_radar.set_ydata(distancias)
+        text_label.set_text("Error distancia")
+        canvas_radar.draw()
+
+def manejar_eco_satelite(frame):
+    try:
+        _, codigo_str = frame.split(":", 1)
+        codigo = int(codigo_str)
+    except ValueError:
+        append_mensaje_sat(f"Mensaje eco desconocido: {frame}")
+        return
+
+    texto = CODIGOS_ECO.get(codigo, f"Mensaje eco desconocido: 1:{codigo}")
+    append_mensaje_sat(texto)
+
+def manejar_distancia(d):
+    global angulos, distancias, max_escala, historial_validas
+    global ultimo_cambio_escala_tiempo
+
+    angulo_deg_radar = obtener_angulo_para_radar()
+    angulo_rad = np.deg2rad(angulo_deg_radar - 90.0)
+    angulos.append(angulo_rad)
+    distancias.append(d)
+
+    if len(angulos) > ventana_puntos:
+        angulos[:] = angulos[-ventana_puntos:]
+        distancias[:] = distancias[-ventana_puntos:]
+
+    line_radar.set_xdata(angulos)
+    line_radar.set_ydata(distancias)
+
+    ahora = time.time()
+    historial_validas.append((ahora, d))
+    historial_validas = [
+        (t, val) for (t, val) in historial_validas
+        if ahora - t <= tiempo_ventana_dist
+    ]
+
+    if historial_validas:
+        max_reciente = max(val for (t, val) in historial_validas)
+
+        if max_reciente > max_escala:
+            max_escala_local = int(max_reciente) + 1
+            ax_radar.set_ylim(0, max_escala_local)
+            actualizar_radiales(ax_radar, max_escala_local)
+            max_escala = max_escala_local
+            ultimo_cambio_escala_tiempo = ahora
+
+        elif (max_escala - max_reciente >= margen_reduccion_dist and
+              (ahora - ultimo_cambio_escala_tiempo >= tiempo_ventana_dist)):
+            max_escala_local = int(max_reciente) + 1
+            ax_radar.set_ylim(0, max_escala_local)
+            actualizar_radiales(ax_radar, max_escala_local)
+            max_escala = max_escala_local
+            ultimo_cambio_escala_tiempo = ahora
+
+    text_label.set_text(
+        f"Ángulo estimado: {angulo_deg_radar-90:.0f}º    Distancia: {d:.1f} cm"
+    )
+    canvas_radar.draw()
+
+
+def actualizar_sync_servo(angulo_real):
+
+    # Actualiza la referencia temporal y de ángulo con una medida REAL del satélite.
+    global ultimo_angulo_deg, servo_ultima_sync_t, servo_ultima_sync_ang, servo_direccion
+
+    ahora = time.time()
+
+    # Si ya teníamos una referencia previa, usamos el cambio para deducir la dirección
+    if servo_ultima_sync_t is not None:
+        delta = angulo_real - servo_ultima_sync_ang
+        if abs(delta) > 1.0:  # umbral de 1 grado para evitar ruido
+            servo_direccion = 1 if delta > 0 else -1
+
+    servo_ultima_sync_t = ahora
+    servo_ultima_sync_ang = angulo_real
+    ultimo_angulo_deg = angulo_real
+
+def angulo_servo_estimado():
+
+    # Calcula el ángulo estimado del servo en función del tiempo y del modelo de movimiento
+
+    global servo_ultima_sync_t, servo_ultima_sync_ang, servo_direccion
+    global servo_tiempo_ciclo_180, ultimo_angulo_deg
+
+    if not usar_prediccion_servo:
+        return ultimo_angulo_deg
+
+    if servo_ultima_sync_t is None or servo_tiempo_ciclo_180 <= 0:
+        # Sin referencia o sin tiempo de ciclo válido, usamos el último valor conocido
+        return ultimo_angulo_deg
+
+    ahora = time.time()
+    dt = ahora - servo_ultima_sync_t
+    if dt <= 0:
+        return servo_ultima_sync_ang
+
+    # Velocidad constante: 180º / tiempo_ciclo (solo ida)
+    v = 180.0 / servo_tiempo_ciclo_180  # grados por segundo
+
+    ang = servo_ultima_sync_ang
+    dir_local = servo_direccion
+    resto = dt
+
+    # Recorremos el tiempo sobrante con un movimiento tipo “triangular” 0-180-0-180...
+    while resto > 0:
+        if dir_local > 0:
+            tiempo_hasta_borde = (180.0 - ang) / v if v > 0 else float('inf')
+            borde = 180.0
+        else:
+            tiempo_hasta_borde = (ang - 0.0) / v if v > 0 else float('inf')
+            borde = 0.0
+
+        if resto <= tiempo_hasta_borde:
+            ang += dir_local * v * resto
+            resto = 0
+        else:
+            ang = borde
+            resto -= tiempo_hasta_borde
+            dir_local *= -1  # cambia de sentido en el borde
+
+    # Limitar bordes por seguridad
+    if ang < 0.0:
+        ang = 0.0
+    elif ang > 180.0:
+        ang = 180.0
+
+    return ang
+
+
+def obtener_angulo_para_radar():
+    # Devuelve el ángulo (estimado o real) que debe usar el radar para la gráfica.
+    return angulo_servo_estimado() if usar_prediccion_servo else ultimo_angulo_deg
+
+def recepcion_datos():
+    global recibiendo, recepcion_activa
+    global temp_buffer, hum_buffer, ultimo_angulo_deg
+
+    while recibiendo:
+        try:
+            linea_bytes = com.read_until(b'|')
+            if not linea_bytes:
+                time.sleep(0.02)
+                continue
+
+            frame = linea_bytes.decode('utf-8', errors='ignore').strip()
+            frame = frame.rstrip('|')
+
+            if not frame:
+                continue
+
+            if frame.startswith("CHKERR"):
+                append_mensaje_sat(f"Error de checksum en enlace Satélite↔Tierra: {frame}")
+                continue
+
+            if frame[0] == '-':
+                manejar_error_codigo(frame)
+                continue
+
+            if ':' in frame:
+                tipo, valor_str = frame.split(':', 1)
+
+                if tipo == '1':
+                    manejar_eco_satelite(frame)
+                    continue
+
+                if tipo == '2':
+                    try:
+                        hum_buffer = float(valor_str)
+                    except ValueError:
+                        append_mensaje_sat(f"Humedad corrupta: {frame}")
+                    continue
+
+                if tipo == '3':
+                    try:
+                        temp_buffer = float(valor_str)
+                    except ValueError:
+                        append_mensaje_sat(f"Temperatura corrupta: {frame}")
+                        continue
+
+                    if recepcion_activa:
+                        commit_muestra_TH()
+                    continue
+
+                if tipo == '4':
+                    append_mensaje_sat(f"Media T enviada desde satélite: {valor_str}")
+                    continue
+
+                if tipo == '5':
+                    try:
+                        d = float(valor_str)
+                        manejar_distancia(d)
+                    except ValueError:
+                        append_mensaje_sat(f"Distancia corrupta: {frame}")
+                    continue
+
+                if tipo == '6':
+                    try:
+                        ang_real = float(valor_str)
+                        actualizar_sync_servo(ang_real)
+                        # print(f"Ángulo real servo: {ang_real}")  # para debug
+                    except ValueError:
+                        append_mensaje_sat(f"Ángulo servo corrupto: {frame}")
+                    continue
+
+
+                append_mensaje_sat(f"Trama desconocida: {frame}")
+                continue
+
+            append_mensaje_sat(f"Mensaje: {frame}")
+
+        except Exception as e:
+            print("Error en recepción:", e)
+            append_mensaje_sat(f"Error en recepción: {e}")
+            break
+
+# =====================================================
+# ACTUALIZACIÓN PERIÓDICA DE LAS GRÁFICAS T/H
+# =====================================================
+
+def actualizar_graficas():
+    global temp, hum
+
+    if t0_TH is not None:
+        tiempo_actual = time.time() - t0_TH
+    else:
+        tiempo_actual = 0.0
+
+    n = min(len(tiempos_TH), len(temperaturas), len(humedades), len(medias_10))
+    if n > 0:
+        x_vals = tiempos_TH[:n]
+        y_temp = temperaturas[:n]
+        y_hum = humedades[:n]
+        y_media = medias_10[:n]
+
+        linea_temp.set_data(x_vals, y_temp)
+        linea_hum.set_data(x_vals, y_hum)
+        linea_media.set_data(x_vals, y_media)
+    else:
+        linea_temp.set_data([], [])
+        linea_hum.set_data([], [])
+        linea_media.set_data([], [])
+        x_vals = []
+
+    if t0_TH is not None:
+        t_max_ventana = max(VENTANA_TIEMPO, tiempo_actual)
+        t_min_ventana = max(0.0, t_max_ventana - VENTANA_TIEMPO)
+    else:
+        t_min_ventana = 0.0
+        t_max_ventana = VENTANA_TIEMPO
+
+    for ax in (ax1, ax2, ax3):
+        ax.set_xlim(t_min_ventana, t_max_ventana)
+        ax.relim()
+        ax.autoscale_view(scalex=False, scaley=True)
+
+    ax1.set_title(f"Temperatura actual: {temp:.2f} °C")
+    ax2.set_title(f"Humedad actual: {hum:.2f} %")
+    if len(medias_10) > 0 and not np.isnan(medias_10[-1]):
+        ax3.set_title(f"Media actual: {medias_10[-1]:.2f} °C")
+    else:
+        ax3.set_title("Media actual: N/A")
+
+    canvas_temp.draw()
+    root.after(500, actualizar_graficas)
+
+# =====================================================
+# INICIO DE LA APLICACIÓN
+# =====================================================
+
+def arrancar_recepcion_al_inicio():
+    global recibiendo, recepcion_activa
+
+    if not recibiendo:
+        recibiendo = True
+        recepcion_activa = True
+        hilo = threading.Thread(target=recepcion_datos, daemon=True)
+        hilo.start()
+        print("Recepción arrancada al inicio.")
+
+root.after(100, arrancar_recepcion_al_inicio)
+root.after(500, actualizar_graficas)
+root.after(200, actualizar_mensajes_satelite)
+root.mainloop()
