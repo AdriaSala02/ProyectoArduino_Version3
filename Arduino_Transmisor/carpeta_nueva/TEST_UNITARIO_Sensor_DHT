@@ -1,0 +1,43 @@
+#include <unity.h>
+
+// Mock de lecturas
+float mockTemp = 25.0;
+float mockHum  = 50.0;
+
+class MockDHT {
+public:
+  float readTemperature() { return mockTemp; }
+  float readHumidity() { return mockHum; }
+};
+
+MockDHT dht;
+
+void test_dht_valores_validos() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  TEST_ASSERT_FALSE(isnan(t));
+  TEST_ASSERT_FALSE(isnan(h));
+}
+
+void test_media_temperatura() {
+  bufferTemps[0] = 20;
+  bufferTemps[1] = 30;
+  numTemp = 2;
+
+  float media = calcularMedia();
+  TEST_ASSERT_EQUAL_FLOAT(25.0, media);
+}
+
+void test_dht_error_nan() {
+  mockTemp = NAN;
+  TEST_ASSERT_TRUE(isnan(dht.readTemperature()));
+}
+
+void setup() {
+  UNITY_BEGIN();
+  RUN_TEST(test_dht_valores_validos);
+  RUN_TEST(test_media_temperatura);
+  RUN_TEST(test_dht_error_nan);
+  UNITY_END();
+}
