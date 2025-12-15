@@ -1,0 +1,42 @@
+#include <unity.h>
+#include "mocks.h"
+
+// Reemplazamos mySerial
+MockSerial mockSerial;
+#define mySerial mockSerial
+
+void test_checksum_ok() {
+  uint8_t payload[2] = {0x01, 0x02};
+  uint8_t cs = calcChecksum(TYPE_DATA, 2, payload);
+
+  TEST_ASSERT_EQUAL_UINT8(TYPE_DATA + 2 + 1 + 2, cs);
+}
+
+void test_send_frame_structure() {
+  mockSerial.reset();
+  uint8_t payload[1] = {0x55};
+
+  sendFrame(TYPE_DATA, payload, 1);
+
+  TEST_ASSERT_EQUAL(STX, mockSerial.buffer[0]);
+  TEST_ASSERT_EQUAL(TYPE_DATA, mockSerial.buffer[1]);
+  TEST_ASSERT_EQUAL(1, mockSerial.buffer[2]);
+  TEST_ASSERT_EQUAL(0x55, mockSerial.buffer[3]);
+}
+
+void test_enviar_error() {
+  mockSerial.reset();
+  enviarError(-5);
+
+  TEST_ASSERT_EQUAL(STX, mockSerial.buffer[0]);
+  TEST_ASSERT_EQUAL(TYPE_DATA, mockSerial.buffer[1]);
+  TEST_ASSERT_EQUAL(1, mockSerial.buffer[2]);
+}
+
+void setup() {
+  UNITY_BEGIN();
+  RUN_TEST(test_checksum_ok);
+  RUN_TEST(test_send_frame_structure);
+  RUN_TEST(test_enviar_error);
+  UNITY_END();
+}
