@@ -1,0 +1,39 @@
+#include <unity.h>
+
+int ultimoAngulo = -1;
+
+class MockServo {
+public:
+  void write(int ang) { ultimoAngulo = ang; }
+};
+
+MockServo servoMotor;
+
+void test_servo_manual_ok() {
+  int anguloEntrada = 30;   // [-90,90]
+  int anguloServo = anguloEntrada + 90;
+
+  servoMotor.write(anguloServo);
+  TEST_ASSERT_EQUAL(120, ultimoAngulo);
+}
+
+void test_servo_fuera_rango() {
+  int anguloEntrada = 100;
+  TEST_ASSERT_TRUE(anguloEntrada > 90);
+}
+
+void test_servo_limites() {
+  servoMotor.write(0);
+  TEST_ASSERT_EQUAL(0, ultimoAngulo);
+
+  servoMotor.write(180);
+  TEST_ASSERT_EQUAL(180, ultimoAngulo);
+}
+
+void setup() {
+  UNITY_BEGIN();
+  RUN_TEST(test_servo_manual_ok);
+  RUN_TEST(test_servo_fuera_rango);
+  RUN_TEST(test_servo_limites);
+  UNITY_END();
+}
