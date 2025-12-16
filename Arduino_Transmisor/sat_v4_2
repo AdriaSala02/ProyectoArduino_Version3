@@ -1,143 +1,121 @@
-// ESTACIÓN TIERRA
-// Python <===> Estación de Tierra
+// SATÉLITE
+// Satélite <===> Estación de Tierra
 
 #include <SoftwareSerial.h>
+#include <DHT.h>
+#include <Servo.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 #include <stdint.h>
-#define BAUDRATE   9600
 
-#define LED_PIN      13   // LED de actividad (verde)
-#define LED_ERROR    12   // LED rojo de error
-#define LED_CHKERR    8   // Error Checksum
-#define LED_RXPY      7   // Se enciende si se lee correctamente de python y se traduce a binario
+// Pines
+#define DHTPIN   2
+#define DHTTYPE  DHT11
+#define TRIG_PIN 7
+#define ECHO_PIN 8
+#define SERVO_PIN 3
+#define LED_PIN 12 // blanco
+#define LED_E 9    // azul
+#define LED_ERR_Dist 4 //amarillo
+#define LED_CHK_ERR_S 13 // rojo
 
-
-// Protocolo binario (igual que en el satélite)
+// Protocolo binario
 #define STX         0xAA
 #define TYPE_CMD    0x01
 #define TYPE_DATA   0x10
 #define TYPE_STATUS 0x11
 
-SoftwareSerial mySerial(10, 11);  // RX, TX con Satélite
+SoftwareSerial mySerial(10, 11);  // RX, TX con Arduino Tierra
+Servo servoMotor;
+DHT dht(DHTPIN, DHTTYPE);
 
-
-// =========================
-// Validación de comandos desde Python
-// Formato esperado: "g:c" o "g:c:v"
-// g = grupo (0..3)
-// c = código según el protocolo
-// v = parámetro (int16), opcional según comando
-// =========================
-
-// Comprueba si un String representa un entero válido (con signo opcional)
-bool esEntero(const String &s) {
-  if (s.length() == 0) return false;
+// VARIABLES
 
   int i = 0;
-  if (s[0] == '+' || s[0] == '-') {
-    if (s.length() == 1) return false; // solo signo no vale
-    i = 1;
-  }
 
-  for (; i < (int)s.length(); i++) {
-    if (!isDigit(s[i])) return false;
-  }
-  return true;
-}
+  // Periodos GLOBALES
+  unsigned long periodoGlobalEnvio = 1000;   // ms. 0 = sin límite global
+  unsigned long ultimoEnvioGlobal  = 0;      // último envío de *cualquier* dato
 
-// Parsea y valida el comando completo.
-// Devuelve true si es válido. Si devuelve false, NO se debe procesar.
-// Además se comprueba que (grupo, código) tenga sentido según tu protocolo.
-bool parseComandoPython(const String &com, int &grupo, int &codigo, long &valor1) {
-  int p1 = com.indexOf(':');
-  int p2 = -1;
+  // Sensor de distancia
+  const float MIN_CM = 3.0;
+  const float MAX_CM = 700.0;
+  const unsigned long TIMEOUT_DIST = 30000;
 
-  if (p1 >= 0) {
-    p2 = com.indexOf(':', p1 + 1);
-  }
+  const int NUM_MEDIDAS = 3;
+  bool enviarDistancia = true;
+  unsigned long periodoDistancia = 1000;    // ms
+  unsigned long ultimoEnvioDist  = 0;
 
-  // Más de dos ':' → formato incorrecto
-  if (p1 < 0) {
-    return false; // no hay ni un ':'
-  }
-  int p3 = (p2 >= 0) ? com.indexOf(':', p2 + 1) : -1;
-  if (p3 >= 0) {
-    // hay un tercer ':' → formato no válido
-    return false;
-  }
+  // SERVO
+  const int PASO_SERVO = 2;
+  const unsigned long INTERVALO_SERVO = 20;
+  unsigned long tUltimoServo = 0;
+  int angulo = 0;
+  int direccion = 1;
+  unsigned long tiempoCicloServo = 3000;   // ms que tarda en hacer 180º
 
-  String sGrupo;
-  String sCodigo;
-  String sValor;
+  // Control del envío de datos del servo
+  unsigned long periodoServoDatos     = 1000;   // ms telemetría servo
+  unsigned long ultimoEnvioServoDatos = 0;
+  bool enviarServoDatos               = false;  // telemetría desactivada por defecto
 
-  if (p2 < 0) {
-    // Formato "g:c"
-    sGrupo = com.substring(0, p1);
-    sCodigo = com.substring(p1 + 1);
-    sValor = "0";
-  } else {
-    // Formato "g:c:v"
-    sGrupo = com.substring(0, p1);
-    sCodigo = com.substring(p1 + 1, p2);
-    if (p2 + 1 < (int)com.length()) {
-      sValor = com.substring(p2 + 1);
-    } else {
-      sValor = "0";
-    }
-  }
+  // Modos del servo
+  bool modoManual              = false;
+  int  anguloObjetivo          = 0;
+  unsigned long inicioManual   = 0;
+  const unsigned long TIEMPO_MANTENER_ANG = 4000;
+  bool servoMovimientoActivo   = true;    // controla el barrido automático
 
-  // Comprobar que las tres partes son enteros válidos
-  if (!esEntero(sGrupo) || !esEntero(sCodigo) || !esEntero(sValor)) {
-    return false;
-  }
+  // DHT
+  bool enviarDatosDHT          = true;
+  unsigned long periodoDHT     = 1000;   // en ms
+  unsigned long ultimoEnvioDHT = 0;
 
-  grupo  = sGrupo.toInt();
-  codigo = sCodigo.toInt();
-  valor1 = sValor.toInt();
-
-  // Rango básico de grupo
-  if (grupo < 0 || grupo > 3) {
-    return false;
-  }
-
-  // Validación (grupo, código) según tu protocolo
-  // 0 GLOBAL:   1=Start, 2=Stop, 3=T
-  // 1 DHT:      1=Start, 2=Stop, 3=T, 4=MediaPy, 5=MediaSat
-  // 2 SERVO:    1=SetAng, 2=StopAuto, 3=StartAuto, 4=TlmT
-  // 3 DIST:     1=Start, 2=Stop, 3=T
-  switch (grupo) {
-    case 0:
-      if (codigo < 1 || codigo > 3) return false;
-      break;
-    case 1:
-      if (codigo < 1 || codigo > 5) return false;
-      break;
-    case 2:
-      if (codigo < 1 || codigo > 5) return false;
-      break;
-    case 3:
-      if (codigo < 1 || codigo > 3) return false;
-      break;
-    default:
-      return false;
-  }
-
-  // Rango del parámetro para caber en int16_t
-  if (valor1 < -32768L || valor1 > 32767L) {
-    return false;
-  }
-
-  // Si quieres, aquí podrías añadir validaciones más finas por comando,
-  // por ejemplo rango de ángulo SERVO -90..90, etc.
-
-  return true;
-}
+  // Para la media
+  bool  calcularMediaEnSatelite = true;  // true = la media se calcula y envía desde el satélite
+  float bufferTemps[10];
+  int   indiceTemp = 0;
+  int   numTemp    = 0;
+  float mediaTemp  = 0.0;
+  unsigned long ultimoEnvioMedia = 0;
+  bool mediaPendiente = false;   // hay una media calculada esperando a ser enviada
 
 
-// =========================
-// Protocolo binario (Tierra <-> Satélite)
-// =========================
+  // Buffers para comunicación (texto, ya no usados)
+  static char ultimo_comando[64] = "";
+  static uint8_t frameIndex = 0;
+  unsigned long ultimoErrorChk = 0;
+  const unsigned long DURACION_LED_CHK = 200;
 
-uint8_t calcChecksumBin(uint8_t type, uint8_t len, const uint8_t *payload) {
+  // Estado de recepción binaria
+  static uint8_t rxState = 0;
+  static uint8_t rxType  = 0;
+  static uint8_t rxLen   = 0;
+  static uint8_t rxBuf[16];
+  static uint8_t rxIndex = 0;
+
+
+
+bool verificarYExtraercuerpo(const char *frame, char *dataOut, size_t outSize);
+void enviarCodigoMensaje(uint16_t code);
+
+long  medirPulso();
+float medirDistanciaMedia(int n);
+float calcularMedia();
+bool  puedeEnviarGlobal();
+
+// Protocolo binario
+uint8_t calcChecksum(uint8_t type, uint8_t len, const uint8_t *payload);
+void sendFrame(uint8_t type, const uint8_t *payload, uint8_t len);
+void enviarDatoFloat(int8_t id, float valor);
+void enviarDatoByte(int8_t id, int8_t valor);
+void enviarError(int8_t idError);
+void procesarFrameComando(uint8_t *payload, uint8_t len, unsigned long ahora);
+
+
+uint8_t calcChecksum(uint8_t type, uint8_t len, const uint8_t *payload) {
   uint16_t sum = type + len;
   for (uint8_t i = 0; i < len; i++) {
     sum += payload[i];
@@ -146,60 +124,398 @@ uint8_t calcChecksumBin(uint8_t type, uint8_t len, const uint8_t *payload) {
 }
 
 void sendFrame(uint8_t type, const uint8_t *payload, uint8_t len) {
-  uint8_t cs = calcChecksumBin(type, len, payload);
-  mySerial.write((uint8_t)STX);  // 0xAA
+  uint8_t cs = calcChecksum(type, len, payload);
+  mySerial.write((uint8_t)STX);
   mySerial.write(type);
   mySerial.write(len);
   if (len > 0 && payload != NULL) {
     mySerial.write(payload, len);
   }
+
+  // PRUEBA: checksum CORRECTO (comportamiento normal)
   mySerial.write(cs);
+
+  // PRUEBA checksum MALO a propósito
+  //mySerial.write((uint8_t)(cs + 1));   // <-- ERROR INTENCIONAL
 }
 
 
+// Enviar código de mensaje de estado: TYPE_STATUS + code (100..403)
+void enviarCodigoMensaje(uint16_t code) {
+  uint8_t payload[2];
+  payload[0] = (uint8_t)(code & 0xFF);
+  payload[1] = (uint8_t)(code >> 8);
+  sendFrame(TYPE_STATUS, payload, 2);
+}
 
-// Buffer de recepción binaria desde el Satélite
-  static uint8_t rxState  = 0;
-  static uint8_t rxType   = 0;
-  static uint8_t rxLen    = 0;
-  static uint8_t rxBuf[16];
-  static uint8_t rxIndex  = 0;
+// Enviar dato float (id: 2,3,4,5)
+void enviarDatoFloat(int8_t id, float valor) {
+  union {
+    float f;
+    uint8_t b[4];
+  } u;
+  u.f = valor;
 
+  uint8_t payload[1 + 4];
+  payload[0] = (uint8_t)id;    // se interpretará como int8_t en Tierra
+  payload[1] = u.b[0];
+  payload[2] = u.b[1];
+  payload[3] = u.b[2];
+  payload[4] = u.b[3];
+
+  sendFrame(TYPE_DATA, payload, sizeof(payload));
+}
+
+// Enviar dato byte (id: 6 ángulo, o similares)
+void enviarDatoByte(int8_t id, int8_t valor) {
+  uint8_t payload[2];
+  payload[0] = (uint8_t)id;
+  payload[1] = (uint8_t)valor;
+  sendFrame(TYPE_DATA, payload, sizeof(payload));
+}
+
+// Enviar solo un código de error (id negativo: -2, -3, -5, -6)
+void enviarError(int8_t idError) {
+  uint8_t payload[1];
+  payload[0] = (uint8_t)idError;   // -2, -3, -5, -6
+  sendFrame(TYPE_DATA, payload, 1);
+}
+
+
+// Medidas y tiempos
+
+long medirPulso() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  return pulseIn(ECHO_PIN, HIGH, TIMEOUT_DIST);
+}
+
+float medirDistanciaMedia(int n) {
+  float v[10]; // entran hasta 10 medidas
+  int medidas_validas = 0;
+ 
+  if (n > 10) {
+    n = 10;
+  }
+
+  for (int i = 0; i < n; i++) {
+    long duracion = medirPulso();
+
+    if (duracion == 0) { // por si no ha habido eco
+      continue;
+    }
+    float d = duracion * 0.0343f / 2.0f;
+
+    if ((d < MIN_CM) || (d > MAX_CM)) {
+      Serial.println(F("fuera de rango"));
+      continue;
+    }
+
+    v[medidas_validas] = d;
+    medidas_validas++;
+
+    delayMicroseconds(300);
+  }
+
+  if (medidas_validas == 0)
+    return -1.0f;   // error
+
+  // Ordenación con método burbuja
+  for (int i = 0; i < medidas_validas - 1; i++) {
+    for (int j = 0; j < medidas_validas - 1 - i; j++) {
+      if (v[j] > v[j + 1]) {
+        float dist_temporal = v[j];
+        v[j] = v[j + 1];
+        v[j + 1] = dist_temporal;
+      }
+    }
+  }
+
+  return v[medidas_validas / 2]; // mediana
+}
+
+float calcularMedia() {
+  if (numTemp == 0) return 0.0f;
+  float suma = 0.0f;
+  for (int i = 0; i < numTemp; i++) suma += bufferTemps[i];
+  return suma / (float)numTemp;
+}
+
+// Devuelve true si ya ha pasado el periodo global entre envíos.
+// Si periodoGlobalEnvio == 0, no hay límite global.
+bool puedeEnviarGlobal() {
+  if (periodoGlobalEnvio == 0) {
+    return true;
+  }
+  unsigned long ahora = millis();
+  if (ahora - ultimoEnvioGlobal >= periodoGlobalEnvio) {
+    ultimoEnvioGlobal = ahora;  // actualizamos el último envío global
+    return true;
+  }
+  return false;
+}
 
 // =========================
-// Setup
+// Procesar comandos binarios
 // =========================
+
+void procesarFrameComando(uint8_t *payload, uint8_t len, unsigned long ahora) {
+  if (len < 2) return;
+
+  int grupo  = payload[0];
+  int codigo = payload[1];
+  long valor1 = 0;
+  long valor2 = 0;  // ya no lo usamos, pero lo dejamos por compatibilidad mental :)
+
+  if (len >= 4) {
+    int16_t v = (int16_t)(payload[2] | (payload[3] << 8));
+    valor1 = (long)v;
+  }
+
+  // DEBUG para comprobar que llegan comandos
+  Serial.print(F("Comando recibido: grupo="));
+  Serial.print(grupo);
+  Serial.print(F(" codigo="));
+  Serial.print(codigo);
+  Serial.print(F(" v1="));
+  Serial.println(valor1);
+
+  // ======================================================
+  // Grupo 0: General (0:...)
+  // ======================================================
+  if (grupo == 0) {
+
+    // 0:1:0| --> empezar global
+    if (codigo == 1) {
+      enviarDatosDHT        = true;
+      enviarDistancia       = true;
+      enviarServoDatos      = true;
+      servoMovimientoActivo = true;
+      enviarCodigoMensaje(101); // SAT_GLOBAL_START
+    }
+
+    // 0:2:0|  -> parar global
+    else if (codigo == 2) {
+      enviarDatosDHT        = false;
+      enviarDistancia       = false;
+      enviarServoDatos      = false;
+      servoMovimientoActivo = false;
+      enviarCodigoMensaje(102); // SAT_GLOBAL_STOP
+    }
+
+    // 0:3:T|  -> periodo global
+    else if (codigo == 3) {
+      if (valor1 == 0) {
+        periodoGlobalEnvio = 0;
+        enviarCodigoMensaje(103); // SAT_GLOBAL_T_OFF
+      } else if (valor1 >= 100 && valor1 <= 10000) {
+        periodoGlobalEnvio = (unsigned long)valor1;
+
+        // forzamos todos los periodos a ser el global
+        periodoDHT        = periodoGlobalEnvio;
+        periodoDistancia  = periodoGlobalEnvio;
+        periodoServoDatos = periodoGlobalEnvio;
+
+        enviarCodigoMensaje(104); // SAT_GLOBAL_T_SET
+      } else {
+        enviarCodigoMensaje(105); // SAT_GLOBAL_T_ERR
+      }
+    }
+  }
+
+  // ======================================================
+  // Grupo 1: Sensor humedad / temperatura (1:...)
+  // ======================================================
+  else if (grupo == 1) {
+    // 1:1|--> iniciar dht
+    if (codigo == 1) {
+      enviarDatosDHT = true;
+      enviarCodigoMensaje(200); // DHT_ON
+    }
+
+    //1:2|  --> parar envío
+    else if (codigo == 2) {
+      enviarDatosDHT = false;
+      digitalWrite(LED_PIN, LOW);
+      enviarCodigoMensaje(201); // DHT_OFF
+    }
+
+    // 1:3:T|  --> cambiar periodo de envío solo DHT (ms)
+    else if (codigo == 3) {
+      if (valor1 >= 500 && valor1 <= 5000) {
+        periodoDHT = (unsigned long)valor1;
+        enviarCodigoMensaje(202); // DHT_T_SET
+      } else {
+        enviarCodigoMensaje(203); // DHT_T_ERR
+      }
+    }
+
+    // 1:4:0|  --> media en Python (Tierra)
+    else if (codigo == 4) {
+      calcularMediaEnSatelite = false;
+
+      // Reset del buffer de media
+      indiceTemp = 0;
+      numTemp = 0;
+      mediaTemp = 0.0f;
+      ultimoEnvioMedia = 0;
+
+      enviarCodigoMensaje(204); // DHT_MEAN_PY
+    }
+
+    // 1:5:0|  --> media en Satélite
+    else if (codigo == 5) {
+      calcularMediaEnSatelite = true;
+
+      // Reset del buffer de media
+      indiceTemp = 0;
+      numTemp = 0;
+      mediaTemp = 0.0f;
+      ultimoEnvioMedia = 0;
+
+      enviarCodigoMensaje(205); // DHT_MEAN_SAT
+    }
+  }
+
+  // ======================================================
+  // Grupo 2: Servo (2:...)
+  // ======================================================
+  else if (grupo == 2) {
+    // 2:1:A|  -> mover al ángulo deseado manualmente
+    if (codigo == 1) {
+      int nuevoAngulo = (int)valor1;  // ángulo en rango [-90,90] desde Tierra
+
+      if (nuevoAngulo >= -90 && nuevoAngulo <= 90) {
+        int nuevoAnguloServo = nuevoAngulo + 90;
+
+        anguloObjetivo = nuevoAnguloServo;
+        angulo         = anguloObjetivo;
+        servoMotor.write(anguloObjetivo);
+
+        modoManual   = true;
+        inicioManual = ahora;
+
+        // Confirmación numérica a Tierra: dato 6 = ángulo del servo
+        enviarDatoByte(6, (int8_t)nuevoAnguloServo);
+
+        enviarCodigoMensaje(300); // SERVO_SET_OK
+      } else {
+        enviarError(-6);  // error de ángulo/servo
+        enviarCodigoMensaje(301); // SERVO_ANGLE_ERR
+      }
+    }
+
+    // 2:2:0|  -> parar movimiento del servo (barrido automático)
+    else if (codigo == 2) {
+      servoMovimientoActivo = false;
+      enviarCodigoMensaje(302); // SERVO_AUTO_OFF
+    }
+
+    // 2:3:0|  -> reanudar movimiento del servo
+    else if (codigo == 3) {
+      servoMovimientoActivo = true;
+      enviarCodigoMensaje(303); // SERVO_AUTO_ON
+    }
+
+    // 2:4:T|  -> periodo envío ángulo (telemetría)
+    else if (codigo == 4) {
+      if (valor1 == 0) {
+        enviarServoDatos = false;
+        enviarCodigoMensaje(304); // SERVO_TLM_OFF
+      } else if (valor1 >= 100 && valor1 <= 5000) {
+        periodoServoDatos = (unsigned long)valor1;
+        enviarServoDatos  = true;
+        enviarCodigoMensaje(305); // SERVO_TLM_SET
+      } else {
+        enviarCodigoMensaje(306); // SERVO_TLM_ERR
+      }
+    }
+
+    // 2:5:Tciclo|  -> tiempo (en ms) para recorrer 180º
+    else if (codigo == 5) {
+      Serial.print(F("Comando 2:5 recibido. valor1 = "));
+      Serial.println(valor1);
+
+      if (valor1 >= 200 && valor1 <= 20000) {
+        tiempoCicloServo = (unsigned long)valor1;
+        Serial.print(F("Nuevo tiempoCicloServo = "));
+        Serial.println(tiempoCicloServo);
+        enviarCodigoMensaje(307);
+      } else {
+        Serial.println(F("ERROR: tiempoCicloServo fuera de rango."));
+        enviarCodigoMensaje(308);
+      }
+    }
+  }
+
+  // ======================================================
+  // Grupo 3: Ultrasonidos (3:...)
+  // ======================================================
+  else if (grupo == 3) {
+    // 3:1:0|  -> Start envío distancia
+    if (codigo == 1) {
+      enviarDistancia = true;
+      enviarCodigoMensaje(400); // DIST_ON
+    }
+
+    // 3:2:0|  -> Stop distancia
+    else if (codigo == 2) {
+      enviarDistancia = false;
+      enviarCodigoMensaje(401); // DIST_OFF
+    }
+
+    // 3:3:T|  -> Periodo distancia (ms)
+    else if (codigo == 3) {
+      if (valor1 >= 100 && valor1 <= 10000) {
+        periodoDistancia = (unsigned long)valor1;
+        enviarCodigoMensaje(402); // DIST_T_SET
+      } else {
+        enviarCodigoMensaje(403); // DIST_T_ERR
+      }
+    }
+  }
+}
 
 void setup() {
 
-  Serial.begin(BAUDRATE);   // USB <--> Python
-  mySerial.begin(BAUDRATE); // Enlace con Satélite
+  //pinMode(LED_PIN, OUTPUT);     // esta comentado porque si no el LED es un faro
+  pinMode(LED_ERR_Dist, OUTPUT);
+  pinMode(LED_E, OUTPUT);
+  pinMode(LED_CHK_ERR_S, OUTPUT);
+  digitalWrite(LED_CHK_ERR_S, LOW);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(LED_ERROR, OUTPUT);
-  pinMode(LED_CHKERR, OUTPUT);
-  pinMode(LED_RXPY, OUTPUT);
-  digitalWrite(LED_RXPY, LOW);
-  digitalWrite(LED_PIN, LOW);
-  digitalWrite(LED_ERROR, LOW);
-  digitalWrite(LED_CHKERR, LOW);
+  Serial.begin(9600);      // Radar / debug
+  mySerial.begin(9600);    // Comunicación con Tierra
 
   Serial.setTimeout(50);
   mySerial.setTimeout(50);
 
-  Serial.println(F("Estación de tierra lista. Esperando comandos desde Python."));
-}
+  dht.begin();
 
+  servoMotor.attach(SERVO_PIN);
+  servoMotor.write(angulo);
+
+  Serial.println(F("Satelite listo. Transmisión activa."));
+  enviarCodigoMensaje(100);   // SAT_INIT
+  tUltimoServo = millis();
+}
 
 void loop() {
 
+  unsigned long ahora = millis();
+  static unsigned long ultimoRx = 0;          // OJO
 
-  // Lectura de datos desde el Satélite (BINARIO)
-  // y reenvío a Python en TEXTO.
-
-
+  // =========================
+  // RECEPCIÓN DE FRAMES BINARIOS
+  // =========================
   while (mySerial.available()) {
     uint8_t b = (uint8_t)mySerial.read();
+    ultimoRx = ahora;
 
     switch (rxState) {
       case 0:  // esperando STX
@@ -216,9 +532,9 @@ void loop() {
       case 2:  // LEN
         rxLen = b;
         if (rxLen > sizeof(rxBuf)) {
-          // overflow: error de trama
-          //digitalWrite(LED_CHKERR, HIGH);
-          digitalWrite(LED_ERROR, HIGH);
+          // overflow => error
+          digitalWrite(LED_CHK_ERR_S, HIGH);
+          ultimoErrorChk = millis();
           rxState = 0;
         } else {
           rxIndex = 0;
@@ -232,169 +548,210 @@ void loop() {
           rxState = 4;
         }
         break;
-
-      case 4: { // CHECKSUM
+      
+      
+      case 4: { // CHECKSUM con comportamiento normal
         uint8_t csRecv = b;
-        uint8_t csCalc = calcChecksumBin(rxType, rxLen, rxBuf);
+        uint8_t csCalc = calcChecksum(rxType, rxLen, rxBuf);
 
         if (csRecv != csCalc) {
-          // Checksum incorrecto: encendemos LED_CHKERR y LED_ERROR
-          digitalWrite(LED_CHKERR, HIGH);
-          //digitalWrite(LED_ERROR, HIGH);
-          // Aviso mínimo a Python
-          Serial.print(F("CHKERR|"));
-          rxState = 0;
-          break;
-        }
-
-        // Checksum OK
-        digitalWrite(LED_CHKERR, LOW);
-
-        bool errorFrame = false;
-
-        if (rxType == TYPE_DATA) {
-          // rxBuf[0] = id_dato (int8)
-          int8_t id = (int8_t)rxBuf[0];
-
-          if (rxLen == 1) {
-            // Solo id (errores: -2, -3, -5, -6)
-            // Enviamos "-2|", "-3|", etc. a Python
-            Serial.print(id);
-            Serial.print('|');
-            errorFrame = true;  // cualquier id negativo es error
-          }
-          else if (rxLen == 5) {
-            // id + float (humedad, temperatura, media, distancia)
-            union {
-              float f;
-              uint8_t b[4];
-            } u;
-            u.b[0] = rxBuf[1];
-            u.b[1] = rxBuf[2];
-            u.b[2] = rxBuf[3];
-            u.b[3] = rxBuf[4];
-
-            float valor = u.f;
-
-            // reenviamos como "id:valor|"
-            Serial.print(id);
-            Serial.print(':');
-            // De momento sin forzar decimales (Python lo parsea igual).
-            Serial.print(valor);
-            Serial.print('|');
-
-            if (id < 0) {
-              errorFrame = true;
-            }
-          }
-          else if (rxLen == 2) {
-            // id + byte (p.ej. id=6 y ángulo 0–180)
-            int8_t id2 = (int8_t)rxBuf[0];
-            int8_t v   = (int8_t)rxBuf[1];
-
-            Serial.print(id2);
-            Serial.print(':');
-            Serial.print(v);
-            Serial.print('|');
-
-            if (id2 < 0) {
-              errorFrame = true;
-            }
-          }
-        }
-        else if (rxType == TYPE_STATUS) {
-          // Códigos 100..403
-          if (rxLen == 2) {
-            uint16_t code = (uint16_t)(rxBuf[0] | (rxBuf[1] << 8));
-
-            // Reenviamos como "1:code|" (mismo formato lógico de antes)
-            Serial.print(F("1:"));
-            Serial.print(code);
-            Serial.print('|');
-
-            // Código de error de checksum en el satélite: 190
-            if (code == 190) {
-              errorFrame = true;
-              // LED_CHKERR lo reservamos para errores locales de enlace,
-              // como ya hacías (la línea estaba comentada).
-            }
-          }
-        }
-
-        // Gestión LED_ERROR según si es error (sensores/servo/estado CHKERR remoto)
-        if (errorFrame) {
-          digitalWrite(LED_ERROR, HIGH);
+          // Checksum INCORRECTO
+          digitalWrite(LED_CHK_ERR_S, HIGH);
+          ultimoErrorChk = millis();
+          enviarCodigoMensaje(190); // SAT_CHK_ERR
+          Serial.println(F("DEBUG: checksum ERROR"));
         } else {
-          digitalWrite(LED_ERROR, LOW);
+          // Checksum OK
+          digitalWrite(LED_CHK_ERR_S, LOW);
+          Serial.println(F("DEBUG: checksum OK"));
+
+          if (rxType == TYPE_CMD) {
+            // Ejecutar comando recibido desde Tierra
+            procesarFrameComando(rxBuf, rxLen, ahora);
+          }
         }
 
         rxState = 0;
         break;
       }
+
+
+      /*
+      case 4: {           // DEBUG que siempre activa CHK_ERR_E
+        uint8_t csRecv = b;
+        uint8_t csCalc = calcChecksum(rxType, rxLen, rxBuf);
+
+        // PRUEBA: fuerza SIEMPRE la rama de error
+        digitalWrite(LED_CHK_ERR_S, HIGH);
+        delay(200);
+        ultimoErrorChk = millis();
+        enviarCodigoMensaje(190); // SAT_CHK_ERR
+        Serial.println(F("DEBUG: rama de checksum ERROR ejecutada"));
+        rxState = 0;
+        break;
+      }
+      */
+
     }
   }
 
-  // =====================================================
-  // 2) Estación Tierra <--> Python (TEXTO)
-  //    Comandos desde Python hacia el Satélite (BINARIO).
-  // =====================================================
-
-  String com = "";
-
-  while (Serial.available()) {
-    // Leemos el último comando completo recibido desde Python (hasta '|')
-    com = Serial.readStringUntil('|');
+  if (millis() - ultimoRx < 200) {
+    digitalWrite(LED_E, HIGH);
+  } else {
+    digitalWrite(LED_E, LOW);
   }
 
-  if (com.length() == 0) {
-    // No hay comando nuevo desde Python
-    return;
+  // LECTURA Y ENVÍO DHT
+  if (enviarDatosDHT && (ahora - ultimoEnvioDHT >= periodoDHT)) {
+
+    ultimoEnvioDHT = ahora;
+    
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    if (isnan(h) || isnan(t)) {
+      //Error con la lectura del sensor de temperatura (-2) y humedad (-3)
+      enviarError(-2);
+      enviarError(-3);
+
+    } else {
+
+      bool mediaLista = false;
+
+      if (calcularMediaEnSatelite) {
+
+        // Si ya tengo una media pendiente de enviar, NO sigo machacando el buffer.
+        // (así no pierdo la media si ese ciclo no se envía por el global limiter)
+        if (!mediaPendiente) {
+          bufferTemps[indiceTemp] = t;
+          indiceTemp = (indiceTemp + 1) % 10;
+
+          if (numTemp < 10) numTemp++;
+
+          if (numTemp == 10) {
+            mediaTemp = calcularMedia();   // media de los 10 valores
+            mediaPendiente = true;         // queda pendiente hasta que se envíe
+          }
+        }
+      }
+
+
+      digitalWrite(LED_PIN, HIGH);
+
+      if (puedeEnviarGlobal()) {
+        enviarDatoFloat(2, h);  // humedad
+        enviarDatoFloat(3, t);  // temperatura
+
+        if (calcularMediaEnSatelite && mediaPendiente) {
+          enviarDatoFloat(4, mediaTemp);  // media
+
+          // IMPORTANTÍSIMO: reseteo SOLO cuando YA LA HE ENVIADO
+          mediaPendiente = false;
+          numTemp = 0;
+          indiceTemp = 0;
+        }
+      }
+    ultimoEnvioDHT = ahora;
+    }  
   }
 
-  // 'com' es el comando en texto recibido desde Python
-  int grupo  = 0;
-  int codigo = 0;
-  long valor1 = 0;
+  // MEDICIÓN DE DISTANCIA (protocolo DATOS id=5 / error -5)
+  if (enviarDistancia && (ahora - ultimoEnvioDist >= periodoDistancia)) {
+    ultimoEnvioDist = ahora;
+    float distancia = medirDistanciaMedia(NUM_MEDIDAS); // número de lecturas que hacen media
 
-  // Validamos sintaxis y contenido
-  if (!parseComandoPython(com, grupo, codigo, valor1)) {
-      // Comando incorrecto
-      digitalWrite(LED_ERROR, HIGH);
-      return;    // OJO: no se envía nada al satélite
+    if (distancia < 0.0f) {
+      // error distancia -> -5
+      enviarError(-5);
+      digitalWrite(LED_ERR_Dist, HIGH);
+    } 
+    else {
+      if (puedeEnviarGlobal()) {
+        digitalWrite(LED_ERR_Dist, LOW);
+        enviarDatoFloat(5, distancia);
+        // Serial.print("Distancia: ");
+        // Serial.println(distancia);       // DEBUG
+      }
+    }
   }
 
-  // Comando correcto
-  digitalWrite(LED_ERROR, LOW);
+  /*
+  // CONTROL MANUAL DE SERVO
+  if (Serial.available() > 0) {
+    int nuevoAngulo = Serial.parseInt();  // parseInt = leer un entero
 
+    if (nuevoAngulo >= -90 && nuevoAngulo <= 90) {
+      int nuevoAnguloServo = nuevoAngulo + 90;
 
-  // Construimos payload binario para TYPE_CMD
-  uint8_t payload[4];
-  payload[0] = (uint8_t)grupo;
-  payload[1] = (uint8_t)codigo;
+      anguloObjetivo = nuevoAnguloServo;
+      angulo = anguloObjetivo;
+      servoMotor.write(anguloObjetivo);
 
-  int16_t v = (int16_t)valor1;
-  payload[2] = (uint8_t)(v & 0xFF);
-  payload[3] = (uint8_t)(v >> 8);
-  
-  digitalWrite(LED_RXPY, HIGH);
-  // Podemos apagarlo tras un pequeño pulso no bloqueante
+      modoManual = true;
+      inicioManual = millis();
 
-  // Enviar comando al Satélite en binario
-  sendFrame(TYPE_CMD, payload, 4);
-  digitalWrite(LED_RXPY, LOW);
-// Podemos apagarlo tras un pequeño pulso no bloqueante
+      if (Serial.available() > 0) {
+        Serial.read();
+      }
 
-  // Gestión del LED de actividad en Tierra
-  // 0:1:0  -> START global
-  // 0:2:0  -> STOP global
-  if (com == "0:1:0") {
-    digitalWrite(LED_PIN, HIGH);
+      mySerial.print(F("Comando recibido. Angulo: "));
+      mySerial.print(nuevoAngulo);
+      mySerial.print(F(" --> "));
+      mySerial.println(nuevoAnguloServo);
+    }
   }
-  else if (com == "0:2:0") {
-    digitalWrite(LED_PIN, LOW);
+  */
+
+  // MOVIMIENTO AUTOMÁTICO SERVO
+  if ((unsigned long)(ahora - tUltimoServo) >= INTERVALO_SERVO) {
+    // Calculamos cuánto tiempo real ha pasado desde el último paso
+    unsigned long dt = ahora - tUltimoServo;   // ms
+    tUltimoServo = ahora;
+
+    if (modoManual) {
+      unsigned long ahoraServo = millis();
+      servoMotor.write(anguloObjetivo);
+
+      if (ahoraServo - inicioManual >= TIEMPO_MANTENER_ANG) {
+        modoManual = false;
+      }
+    }
+    else if (servoMovimientoActivo) {
+      // Velocidad en grados por milisegundo para recorrer 180º en tiempoCicloServo
+      float velDegPorMs = 180.0f / (float)tiempoCicloServo;  // º/ms
+      float delta = velDegPorMs * (float)dt;                 // grados a avanzar en este intervalo
+
+      float nuevoAng = (float)angulo + (direccion * delta);
+
+      if (nuevoAng >= 180.0f) {
+        nuevoAng = 180.0f;
+        direccion = -1;
+      } else if (nuevoAng <= 0.0f) {
+        nuevoAng = 0.0f;
+        direccion = 1;
+      }
+
+      angulo = (int)(nuevoAng + 0.5f);  // redondeo al entero más cercano
+      servoMotor.write(angulo);
+      //Serial.println(angulo);
+    }
   }
 
-  // aquí se puede añadir más lógica local
-  // según otros comandos (p.ej. encender/apagar LED
-  // con el estado de DHT o del servo, etc.).
+  // TELEMETRÍA PERIÓDICA DEL SERVO (id dato 6)
+  if (enviarServoDatos && (ahora - ultimoEnvioServoDatos >= periodoServoDatos)) {
+    ultimoEnvioServoDatos = ahora;
+
+    if (puedeEnviarGlobal()){
+      enviarDatoByte(6, (int8_t)angulo);   // ángulo actual 0–180
+      //digitalWrite(LED_E, HIGH);
+      // Serial.println(cuerpo);
+    }
+  }
+
+  // Apagado del LED de error de checksum tras un tiempo
+  if (digitalRead(LED_CHK_ERR_S) == HIGH) {
+    if (millis() - ultimoErrorChk > DURACION_LED_CHK) {
+      digitalWrite(LED_CHK_ERR_S, LOW);
+    }
+  }
 }
