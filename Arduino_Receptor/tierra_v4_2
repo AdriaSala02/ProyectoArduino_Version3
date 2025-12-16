@@ -1,0 +1,400 @@
+// ESTACIÓN TIERRA
+// Python <===> Estación de Tierra
+
+#include <SoftwareSerial.h>
+#include <stdint.h>
+#define BAUDRATE   9600
+
+#define LED_PIN      13   // LED de actividad (verde)
+#define LED_ERROR    12   // LED rojo de error
+#define LED_CHKERR    8   // Error Checksum
+#define LED_RXPY      7   // Se enciende si se lee correctamente de python y se traduce a binario
+
+
+// Protocolo binario (igual que en el satélite)
+#define STX         0xAA
+#define TYPE_CMD    0x01
+#define TYPE_DATA   0x10
+#define TYPE_STATUS 0x11
+
+SoftwareSerial mySerial(10, 11);  // RX, TX con Satélite
+
+
+// =========================
+// Validación de comandos desde Python
+// Formato esperado: "g:c" o "g:c:v"
+// g = grupo (0..3)
+// c = código según el protocolo
+// v = parámetro (int16), opcional según comando
+// =========================
+
+// Comprueba si un String representa un entero válido (con signo opcional)
+bool esEntero(const String &s) {
+  if (s.length() == 0) return false;
+
+  int i = 0;
+  if (s[0] == '+' || s[0] == '-') {
+    if (s.length() == 1) return false; // solo signo no vale
+    i = 1;
+  }
+
+  for (; i < (int)s.length(); i++) {
+    if (!isDigit(s[i])) return false;
+  }
+  return true;
+}
+
+// Parsea y valida el comando completo.
+// Devuelve true si es válido. Si devuelve false, NO se debe procesar.
+// Además se comprueba que (grupo, código) tenga sentido según tu protocolo.
+bool parseComandoPython(const String &com, int &grupo, int &codigo, long &valor1) {
+  int p1 = com.indexOf(':');
+  int p2 = -1;
+
+  if (p1 >= 0) {
+    p2 = com.indexOf(':', p1 + 1);
+  }
+
+  // Más de dos ':' → formato incorrecto
+  if (p1 < 0) {
+    return false; // no hay ni un ':'
+  }
+  int p3 = (p2 >= 0) ? com.indexOf(':', p2 + 1) : -1;
+  if (p3 >= 0) {
+    // hay un tercer ':' → formato no válido
+    return false;
+  }
+
+  String sGrupo;
+  String sCodigo;
+  String sValor;
+
+  if (p2 < 0) {
+    // Formato "g:c"
+    sGrupo = com.substring(0, p1);
+    sCodigo = com.substring(p1 + 1);
+    sValor = "0";
+  } else {
+    // Formato "g:c:v"
+    sGrupo = com.substring(0, p1);
+    sCodigo = com.substring(p1 + 1, p2);
+    if (p2 + 1 < (int)com.length()) {
+      sValor = com.substring(p2 + 1);
+    } else {
+      sValor = "0";
+    }
+  }
+
+  // Comprobar que las tres partes son enteros válidos
+  if (!esEntero(sGrupo) || !esEntero(sCodigo) || !esEntero(sValor)) {
+    return false;
+  }
+
+  grupo  = sGrupo.toInt();
+  codigo = sCodigo.toInt();
+  valor1 = sValor.toInt();
+
+  // Rango básico de grupo
+  if (grupo < 0 || grupo > 3) {
+    return false;
+  }
+
+  // Validación (grupo, código) según tu protocolo
+  // 0 GLOBAL:   1=Start, 2=Stop, 3=T
+  // 1 DHT:      1=Start, 2=Stop, 3=T, 4=MediaPy, 5=MediaSat
+  // 2 SERVO:    1=SetAng, 2=StopAuto, 3=StartAuto, 4=TlmT
+  // 3 DIST:     1=Start, 2=Stop, 3=T
+  switch (grupo) {
+    case 0:
+      if (codigo < 1 || codigo > 3) return false;
+      break;
+    case 1:
+      if (codigo < 1 || codigo > 5) return false;
+      break;
+    case 2:
+      if (codigo < 1 || codigo > 5) return false;
+      break;
+    case 3:
+      if (codigo < 1 || codigo > 3) return false;
+      break;
+    default:
+      return false;
+  }
+
+  // Rango del parámetro para caber en int16_t
+  if (valor1 < -32768L || valor1 > 32767L) {
+    return false;
+  }
+
+  // Si quieres, aquí podrías añadir validaciones más finas por comando,
+  // por ejemplo rango de ángulo SERVO -90..90, etc.
+
+  return true;
+}
+
+
+// =========================
+// Protocolo binario (Tierra <-> Satélite)
+// =========================
+
+uint8_t calcChecksumBin(uint8_t type, uint8_t len, const uint8_t *payload) {
+  uint16_t sum = type + len;
+  for (uint8_t i = 0; i < len; i++) {
+    sum += payload[i];
+  }
+  return (uint8_t)sum;
+}
+
+void sendFrame(uint8_t type, const uint8_t *payload, uint8_t len) {
+  uint8_t cs = calcChecksumBin(type, len, payload);
+  mySerial.write((uint8_t)STX);  // 0xAA
+  mySerial.write(type);
+  mySerial.write(len);
+  if (len > 0 && payload != NULL) {
+    mySerial.write(payload, len);
+  }
+  mySerial.write(cs);
+}
+
+
+
+// Buffer de recepción binaria desde el Satélite
+  static uint8_t rxState  = 0;
+  static uint8_t rxType   = 0;
+  static uint8_t rxLen    = 0;
+  static uint8_t rxBuf[16];
+  static uint8_t rxIndex  = 0;
+
+
+// =========================
+// Setup
+// =========================
+
+void setup() {
+
+  Serial.begin(BAUDRATE);   // USB <--> Python
+  mySerial.begin(BAUDRATE); // Enlace con Satélite
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(LED_ERROR, OUTPUT);
+  pinMode(LED_CHKERR, OUTPUT);
+  pinMode(LED_RXPY, OUTPUT);
+  digitalWrite(LED_RXPY, LOW);
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(LED_ERROR, LOW);
+  digitalWrite(LED_CHKERR, LOW);
+
+  Serial.setTimeout(50);
+  mySerial.setTimeout(50);
+
+  Serial.println(F("Estación de tierra lista. Esperando comandos desde Python."));
+}
+
+
+void loop() {
+
+
+  // Lectura de datos desde el Satélite (BINARIO)
+  // y reenvío a Python en TEXTO.
+
+
+  while (mySerial.available()) {
+    uint8_t b = (uint8_t)mySerial.read();
+
+    switch (rxState) {
+      case 0:  // esperando STX
+        if (b == STX) {
+          rxState = 1;
+        }
+        break;
+
+      case 1:  // TYPE
+        rxType = b;
+        rxState = 2;
+        break;
+
+      case 2:  // LEN
+        rxLen = b;
+        if (rxLen > sizeof(rxBuf)) {
+          // overflow: error de trama
+          //digitalWrite(LED_CHKERR, HIGH);
+          digitalWrite(LED_ERROR, HIGH);
+          rxState = 0;
+        } else {
+          rxIndex = 0;
+          rxState = (rxLen == 0) ? 4 : 3;
+        }
+        break;
+
+      case 3:  // PAYLOAD
+        rxBuf[rxIndex++] = b;
+        if (rxIndex >= rxLen) {
+          rxState = 4;
+        }
+        break;
+
+      case 4: { // CHECKSUM
+        uint8_t csRecv = b;
+        uint8_t csCalc = calcChecksumBin(rxType, rxLen, rxBuf);
+
+        if (csRecv != csCalc) {
+          // Checksum incorrecto: encendemos LED_CHKERR y LED_ERROR
+          digitalWrite(LED_CHKERR, HIGH);
+          //digitalWrite(LED_ERROR, HIGH);
+          // Aviso mínimo a Python
+          Serial.print(F("CHKERR|"));
+          rxState = 0;
+          break;
+        }
+
+        // Checksum OK
+        digitalWrite(LED_CHKERR, LOW);
+
+        bool errorFrame = false;
+
+        if (rxType == TYPE_DATA) {
+          // rxBuf[0] = id_dato (int8)
+          int8_t id = (int8_t)rxBuf[0];
+
+          if (rxLen == 1) {
+            // Solo id (errores: -2, -3, -5, -6)
+            // Enviamos "-2|", "-3|", etc. a Python
+            Serial.print(id);
+            Serial.print('|');
+            errorFrame = true;  // cualquier id negativo es error
+          }
+          else if (rxLen == 5) {
+            // id + float (humedad, temperatura, media, distancia)
+            union {
+              float f;
+              uint8_t b[4];
+            } u;
+            u.b[0] = rxBuf[1];
+            u.b[1] = rxBuf[2];
+            u.b[2] = rxBuf[3];
+            u.b[3] = rxBuf[4];
+
+            float valor = u.f;
+
+            // reenviamos como "id:valor|"
+            Serial.print(id);
+            Serial.print(':');
+            // De momento sin forzar decimales (Python lo parsea igual).
+            Serial.print(valor);
+            Serial.print('|');
+
+            if (id < 0) {
+              errorFrame = true;
+            }
+          }
+          else if (rxLen == 2) {
+            // id + byte (p.ej. id=6 y ángulo 0–180)
+            int8_t id2 = (int8_t)rxBuf[0];
+            int8_t v   = (int8_t)rxBuf[1];
+
+            Serial.print(id2);
+            Serial.print(':');
+            Serial.print(v);
+            Serial.print('|');
+
+            if (id2 < 0) {
+              errorFrame = true;
+            }
+          }
+        }
+        else if (rxType == TYPE_STATUS) {
+          // Códigos 100..403
+          if (rxLen == 2) {
+            uint16_t code = (uint16_t)(rxBuf[0] | (rxBuf[1] << 8));
+
+            // Reenviamos como "1:code|" (mismo formato lógico de antes)
+            Serial.print(F("1:"));
+            Serial.print(code);
+            Serial.print('|');
+
+            // Código de error de checksum en el satélite: 190
+            if (code == 190) {
+              errorFrame = true;
+              // LED_CHKERR lo reservamos para errores locales de enlace,
+              // como ya hacías (la línea estaba comentada).
+            }
+          }
+        }
+
+        // Gestión LED_ERROR según si es error (sensores/servo/estado CHKERR remoto)
+        if (errorFrame) {
+          digitalWrite(LED_ERROR, HIGH);
+        } else {
+          digitalWrite(LED_ERROR, LOW);
+        }
+
+        rxState = 0;
+        break;
+      }
+    }
+  }
+
+  // =====================================================
+  // 2) Estación Tierra <--> Python (TEXTO)
+  //    Comandos desde Python hacia el Satélite (BINARIO).
+  // =====================================================
+
+  String com = "";
+
+  while (Serial.available()) {
+    // Leemos el último comando completo recibido desde Python (hasta '|')
+    com = Serial.readStringUntil('|');
+  }
+
+  if (com.length() == 0) {
+    // No hay comando nuevo desde Python
+    return;
+  }
+
+  // 'com' es el comando en texto recibido desde Python
+  int grupo  = 0;
+  int codigo = 0;
+  long valor1 = 0;
+
+  // Validamos sintaxis y contenido
+  if (!parseComandoPython(com, grupo, codigo, valor1)) {
+      // Comando incorrecto
+      digitalWrite(LED_ERROR, HIGH);
+      return;    // OJO: no se envía nada al satélite
+  }
+
+  // Comando correcto
+  digitalWrite(LED_ERROR, LOW);
+
+
+  // Construimos payload binario para TYPE_CMD
+  uint8_t payload[4];
+  payload[0] = (uint8_t)grupo;
+  payload[1] = (uint8_t)codigo;
+
+  int16_t v = (int16_t)valor1;
+  payload[2] = (uint8_t)(v & 0xFF);
+  payload[3] = (uint8_t)(v >> 8);
+  
+  digitalWrite(LED_RXPY, HIGH);
+  // Podemos apagarlo tras un pequeño pulso no bloqueante
+
+  // Enviar comando al Satélite en binario
+  sendFrame(TYPE_CMD, payload, 4);
+  digitalWrite(LED_RXPY, LOW);
+// Podemos apagarlo tras un pequeño pulso no bloqueante
+
+  // Gestión del LED de actividad en Tierra
+  // 0:1:0  -> START global
+  // 0:2:0  -> STOP global
+  if (com == "0:1:0") {
+    digitalWrite(LED_PIN, HIGH);
+  }
+  else if (com == "0:2:0") {
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  // aquí se puede añadir más lógica local
+  // según otros comandos (p.ej. encender/apagar LED
+  // con el estado de DHT o del servo, etc.).
+}
