@@ -1,5 +1,5 @@
-**Proyecto LoraSat – Comunicación LoRa entre Arduino y Visualización en Python
-**
+Proyecto LoraSat – Comunicación LoRa entre Arduino y Visualización en Python
+
 Este proyecto implementa un sistema de comunicación inalámbrica utilizando tecnología LoRa entre dos Arduinos, donde uno actúa como satélite y otro como estación terrestre, y una interfaz en Python que permite visualizar en tiempo real los datos captados por el satélite mediante gráficas y radares.
 
 Descripción
