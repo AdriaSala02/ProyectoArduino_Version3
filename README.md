@@ -3,8 +3,7 @@ GRUPO 16
 
 Este proyecto implementa un sistema de comunicación inalámbrica utilizando tecnología LoRa entre dos Arduinos, donde uno actúa como satélite y otro como estación terrestre, y una interfaz en Python que permite visualizar en tiempo real los datos captados por el satélite mediante gráficas y radares.
 
-
-
+------------------------------------------------------------------------------------------------------------------------------------------------------
 
 DESCRIPCIÓN
 
@@ -16,8 +15,7 @@ Arduino Estación Tierra: Recibe los datos enviados por el satélite y los retra
 
 Interfaz Python: Procesa los datos recibidos desde la estación terrestre y los muestra en gráficas y radares en tiempo real, permitiendo un análisis visual intuitivo.
 
-
-
+------------------------------------------------------------------------------------------------------------------------------------------------------
 
 CARACTERÍSTICAS
 
@@ -29,8 +27,7 @@ Visualización de datos en Python con gráficas y diagramas tipo radar.
 
 Estructura modular que facilita agregar nuevos sensores o métricas.
 
-
-
+------------------------------------------------------------------------------------------------------------------------------------------------------
 
 TECNOLOGÍAS UTILIZADAS
 
@@ -46,8 +43,7 @@ tkinter o PyQt para la interfaz (dependiendo de implementación)
 
 pandas o numpy para manejo de datos
 
-
-
+------------------------------------------------------------------------------------------------------------------------------------------------------
 
 CONTRIBUCIÓN
 
